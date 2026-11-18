@@ -1,0 +1,24 @@
+{
+  "extends": "../../configs/base.tsconfig",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "lib",
+    "jsxImportSource": "react"
+  },
+  "include": [
+    "src",
+    "src/**/*.json"
+  ],
+  "references": [
+    {
+      "path": "../../dev-packages/application-package"
+    },
+    {
+      "path": "../../dev-packages/private-re-exports"
+    },
+    {
+      "path": "../../dev-packages/request"
+    }
+  ]
+}

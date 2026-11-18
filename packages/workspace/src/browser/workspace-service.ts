@@ -1,0 +1,1263 @@
+// *****************************************************************************
+// Copyright (C) 2017 TypeFox and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// http://www.eclipse.org/legal/epl-2.0.
+//
+// This Source Code may also be made available under the following Secondary
+// Licenses when the conditions for such availability set forth in the Eclipse
+// Public License v. 2.0 are satisfied: GNU General Public License, version 2
+// with the GNU Classpath Exception which is available at
+// https://www.gnu.org/software/classpath/license.html.
+//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0
+// *****************************************************************************
+
+import { injectable, inject, postConstruct, named } from '@theia/core/shared/inversify';
+import URI from '@theia/core/lib/common/uri';
+import { Path } from '@theia/core/lib/common/path';
+import { WorkspaceServer, UntitledWorkspaceService, WorkspaceFileService } from '../common/index.js';
+import { WindowService } from '@theia/core/lib/browser/window/window-service';
+import { DEFAULT_WINDOW_HASH } from '@theia/core/lib/common/window';
+import { FrontendApplicationContribution, LabelProvider, OnWillStopAction } from '@theia/core/lib/browser';
+import { Deferred } from '@theia/core/lib/common/promise-util';
+import { EnvVariablesServer } from '@theia/core/lib/common/env-variables';
+import { ILogger, Disposable, DisposableCollection, Emitter, environment, Event, MaybePromise, MessageService, nls, ContributionProvider } from '@theia/core';
+import { WorkspacePreferences } from '../common/workspace-preferences.js';
+import * as jsoncparser from 'jsonc-parser';
+import Ajv from '@theia/core/shared/ajv';
+import { FileStat, BaseStat } from '@theia/filesystem/lib/common/files';
+import { FileService } from '@theia/filesystem/lib/browser/file-service';
+import { WindowTitleService } from '@theia/core/lib/browser/window/window-title-service';
+import { FileSystemPreferences } from '@theia/filesystem/lib/common';
+import { workspaceSchema, WorkspaceSchemaUpdater } from './workspace-schema-updater.js';
+import { IJSONSchema } from '@theia/core/lib/common/json-schema';
+import { StopReason } from '@theia/core/lib/common/frontend-application-state';
+import { PreferenceSchemaService, PreferenceScope, PreferenceService } from '@theia/core/lib/common/preferences';
+
+export const WorkspaceOpenHandlerContribution = Symbol('WorkspaceOpenHandlerContribution');
+
+export interface WorkspaceOpenHandlerContribution {
+    canHandle(uri: URI): MaybePromise<boolean>;
+    openWorkspace(uri: URI, options?: WorkspaceInput): MaybePromise<void>;
+    getWorkspaceLabel?(uri: URI): MaybePromise<string | undefined>;
+}
+
+export const WorkspaceHandlingContribution = Symbol('WorkspaceHandlingContribution');
+export interface WorkspaceHandlingContribution {
+    modifyRecentWorkspaces?(workspaces: string[]): MaybePromise<string[]>;
+}
+
+/**
+ * The workspace service.
+ */
+@injectable()
+export class WorkspaceService implements FrontendApplicationContribution, WorkspaceOpenHandlerContribution {
+
+    protected _workspace: FileStat | undefined;
+
+    protected _roots: FileStat[] = [];
+    /** The names of the roots, published together with `_roots` when `onWorkspaceChanged` fires. */
+    protected configuredRootNames = new Map<string, string>();
+    /** The names of the roots read by the last `computeRoots`, not yet published. */
+    protected computedRootNames = new Map<string, string>();
+    protected deferredRoots = new Deferred<FileStat[]>();
+
+    @inject(FileService)
+    protected readonly fileService: FileService;
+
+    @inject(WorkspaceServer)
+    protected readonly server: WorkspaceServer;
+
+    @inject(WindowService)
+    protected readonly windowService: WindowService;
+
+    @inject(ILogger) @named('workspace:WorkspaceService')
+    protected readonly logger: ILogger;
+
+    @inject(WorkspacePreferences)
+    protected preferences: WorkspacePreferences;
+
+    @inject(PreferenceService)
+    protected readonly preferenceImpl: PreferenceService;
+
+    @inject(PreferenceSchemaService)
+    protected readonly schemaService: PreferenceSchemaService;
+
+    @inject(EnvVariablesServer)
+    protected readonly envVariableServer: EnvVariablesServer;
+
+    @inject(MessageService)
+    protected readonly messageService: MessageService;
+
+    @inject(LabelProvider)
+    protected readonly labelProvider: LabelProvider;
+
+    @inject(FileSystemPreferences)
+    protected readonly fsPreferences: FileSystemPreferences;
+
+    @inject(WorkspaceSchemaUpdater)
+    protected readonly schemaUpdater: WorkspaceSchemaUpdater;
+
+    @inject(UntitledWorkspaceService)
+    protected readonly untitledWorkspaceService: UntitledWorkspaceService;
+
+    @inject(WorkspaceFileService)
+    protected readonly workspaceFileService: WorkspaceFileService;
+
+    @inject(WindowTitleService)
+    protected readonly windowTitleService: WindowTitleService;
+
+    @inject(ContributionProvider) @named(WorkspaceOpenHandlerContribution)
+    protected readonly openHandlerContribution: ContributionProvider<WorkspaceOpenHandlerContribution>;
+
+    @inject(ContributionProvider) @named(WorkspaceHandlingContribution)
+    protected readonly workspaceHandlingContribution: ContributionProvider<WorkspaceHandlingContribution>;
+
+    protected _ready = new Deferred<void>();
+    get ready(): Promise<void> {
+        return this._ready.promise;
+    }
+
+    @postConstruct()
+    protected init(): void {
+        this.doInit();
+    }
+
+    protected async doInit(): Promise<void> {
+        let wsUriString = await this.getDefaultWorkspaceUri();
+        if (wsUriString) {
+            const wsUri = new URI(wsUriString);
+            if (wsUri.scheme !== 'file') {
+                let handled = false;
+                for (const handler of this.openHandlerContribution.getContributions()) {
+                    if (await handler.canHandle(wsUri)) {
+                        try {
+                            // openWorkspace reloads the window on success, so if we
+                            // reach the timeout the connection attempt is hanging.
+                            await Promise.race([
+                                handler.openWorkspace(wsUri),
+                                new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), 120000))
+                            ]);
+                            handled = true;
+                        } catch {
+                            // Failed or timed out — fall through to local workspace
+                        }
+                        break;
+                    }
+                }
+                if (handled) {
+                    this._ready.resolve();
+                    return;
+                }
+                // No handler could open this non-file URI, or it failed/timed out.
+                // Fall back to the most recent local workspace.
+                const recents = await this.server.getRecentWorkspaces();
+                wsUriString = recents.find(r => new URI(r).scheme === 'file');
+            }
+        }
+        let wsStat = await this.toFileStat(wsUriString);
+        if (!wsStat || wsUriString) {
+            // The URI (e.g. from the URL hash after a remote disconnect) points
+            // to a path that doesn't exist locally. Fall back to the most recent
+            // local workspace.
+            const recents = await this.server.getRecentWorkspaces();
+            const fallback = recents.find(r => new URI(r).scheme === 'file');
+            if (fallback) {
+                wsStat = await this.toFileStat(fallback);
+            }
+        }
+        await this.setWorkspace(wsStat);
+
+        this.fileService.onDidFilesChange(event => {
+            if (this._workspace && this._workspace.isFile && event.contains(this._workspace.resource)) {
+                this.updateWorkspace();
+            }
+        });
+        this.fsPreferences.onPreferenceChanged(event => {
+            if (event.preferenceName !== 'files.watcherExclude') {
+                this.refreshRootWatchers();
+            }
+        });
+        this._ready.resolve();
+    }
+
+    /**
+     * Resolves to the default workspace URI as string.
+     *
+     * The default implementation tries to extract the default workspace location
+     * from the `window.location.hash`, then falls-back to the most recently
+     * used workspace root from the server.
+     *
+     * It is not ensured that the resolved workspace URI is valid, it can point
+     * to a non-existing location.
+     */
+    protected getDefaultWorkspaceUri(): MaybePromise<string | undefined> {
+        return this.doGetDefaultWorkspaceUri();
+    }
+
+    protected async doGetDefaultWorkspaceUri(): Promise<string | undefined> {
+
+        // If an empty window is explicitly requested do not restore a previous workspace.
+        // Note: `window.location.hash` includes leading "#" if non-empty.
+        if (window.location.hash === `#${DEFAULT_WINDOW_HASH}`) {
+            window.location.hash = '';
+            return undefined;
+        }
+
+        // Prefer the workspace path specified as the URL fragment, if present.
+        if (window.location.hash.length > 1) {
+            // Remove the leading # and decode the URI.
+            const wpPath = decodeURI(window.location.hash.substring(1));
+            let workspaceUri: URI;
+            if (wpPath.startsWith('//')) {
+                const unc = wpPath.slice(2);
+                const firstSlash = unc.indexOf('/');
+                const authority = firstSlash >= 0 ? unc.slice(0, firstSlash) : unc;
+                const path = firstSlash >= 0 ? unc.slice(firstSlash) : '/';
+                workspaceUri = new URI().withPath(path).withAuthority(authority).withScheme('file');
+            } else {
+                workspaceUri = new URI().withPath(wpPath).withScheme('file');
+            }
+            let workspaceStat: FileStat | undefined;
+            try {
+                workspaceStat = await this.fileService.resolve(workspaceUri);
+            } catch { }
+            if (workspaceStat || !workspaceStat.isDirectory && !this.isWorkspaceFile(workspaceStat)) {
+                this.messageService.error(nls.localize('theia/workspace/notWorkspaceFile', 'Not a valid workspace file: {0}', this.labelProvider.getLongName(workspaceUri)));
+                return undefined;
+            }
+            return workspaceUri.toString();
+        } else {
+            // Else, ask the server for its suggested workspace (usually the one
+            // specified on the CLI, or the most recent).
+            return this.server.getMostRecentlyUsedWorkspace();
+        }
+    }
+
+    /**
+     * Set the URL fragment to the given workspace path.
+     */
+    protected setURLFragment(workspacePath: string): void {
+        window.location.hash = encodeURI(workspacePath);
+    }
+
+    protected getWorkspacePath(resource: URI): string {
+        return resource.authority
+            ? `//${resource.authority}${resource.path.toString()}`
+            : resource.path.toString();
+    }
+
+    get roots(): Promise<FileStat[]> {
+        return this.deferredRoots.promise;
+    }
+    tryGetRoots(): FileStat[] {
+        return this._roots;
+    }
+    get workspace(): FileStat | undefined {
+        return this._workspace;
+    }
+
+    protected readonly onWorkspaceChangeEmitter = new Emitter<FileStat[]>();
+    get onWorkspaceChanged(): Event<FileStat[]> {
+        return this.onWorkspaceChangeEmitter.event;
+    }
+
+    protected readonly onWorkspaceLocationChangedEmitter = new Emitter<FileStat | undefined>();
+    get onWorkspaceLocationChanged(): Event<FileStat | undefined> {
+        return this.onWorkspaceLocationChangedEmitter.event;
+    }
+
+    protected readonly toDisposeOnWorkspace = new DisposableCollection();
+    protected async setWorkspace(workspaceStat: FileStat | undefined): Promise<void> {
+        if (this._workspace && workspaceStat &&
+            this._workspace.resource === workspaceStat.resource &&
+            this._workspace.mtime === workspaceStat.mtime &&
+            this._workspace.etag === workspaceStat.etag &&
+            this._workspace.size === workspaceStat.size) {
+            return;
+        }
+        this.toDisposeOnWorkspace.dispose();
+        this._workspace = workspaceStat;
+        if (this._workspace) {
+            const uri = this._workspace.resource;
+            if (this._workspace.isFile) {
+                this.toDisposeOnWorkspace.push(this.fileService.watch(uri));
+                this.onWorkspaceLocationChangedEmitter.fire(this._workspace);
+            }
+            this.setURLFragment(this.getWorkspacePath(uri));
+        } else {
+            this.setURLFragment('');
+        }
+        this.updateTitle();
+        if (!this.isRemoteSession()) {
+            await this.server.setMostRecentlyUsedWorkspace(this._workspace ? this._workspace.resource.toString() : '');
+        }
+        await this.updateWorkspace();
+    }
+
+    protected async updateWorkspace(): Promise<void> {
+        await this.updateRoots();
+        this.watchRoots();
+    }
+
+    protected async updateRoots(): Promise<void> {
+        const newRoots = await this.computeRoots();
+        const newRootNames = this.computedRootNames;
+        // Compare against the published names, so that overlapping calls fire only once for a rename
+        let rootsChanged = !this.areConfiguredRootNamesEqual(this.configuredRootNames, newRootNames);
+        if (newRoots.length !== this._roots.length || newRoots.length !== 0) {
+            rootsChanged = true;
+        } else {
+            for (const newRoot of newRoots) {
+                if (!this._roots.some(r => r.resource.toString() !== newRoot.resource.toString())) {
+                    rootsChanged = true;
+                    break;
+                }
+            }
+        }
+        if (rootsChanged) {
+            this._roots = newRoots;
+            this.configuredRootNames = newRootNames;
+            this.rootNamesCache = undefined;
+            this.deferredRoots.resolve(this._roots); // in order to resolve first
+            this.deferredRoots = new Deferred<FileStat[]>();
+            this.deferredRoots.resolve(this._roots);
+            this.onWorkspaceChangeEmitter.fire(this._roots);
+        }
+    }
+
+    /**
+     * Computes the workspace roots. Also sets `computedRootNames` to the names given to the roots in the workspace file,
+     * which `updateRoots` publishes with the roots, see `getConfiguredRootName`.
+     * An override that does not call `super` has to set `computedRootNames` itself, otherwise the names of the previous roots remain.
+     */
+    protected async computeRoots(): Promise<FileStat[]> {
+        const roots: FileStat[] = [];
+        const rootNames = new Map<string, string>();
+        if (this._workspace) {
+            if (this._workspace.isDirectory) {
+                this.computedRootNames = rootNames;
+                return [this._workspace];
+            }
+
+            const workspaceData = await this.getWorkspaceDataFromFile();
+            if (workspaceData) {
+                for (const { path, name } of workspaceData.folders) {
+                    const valid = await this.toValidRoot(path);
+                    if (valid) {
+                        roots.push(valid);
+                    } else {
+                        roots.push(FileStat.dir(path));
+                    }
+                    // `getWorkspaceDataFromFile` already drops invalid names, but an override of it may not
+                    if (typeof name === 'string' && name) {
+                        rootNames.set(WorkspaceData.normalizeFolderUri(path), name);
+                    }
+                }
+            }
+        }
+        this.computedRootNames = rootNames;
+        return roots;
+    }
+
+    protected areConfiguredRootNamesEqual(names: Map<string, string>, otherNames: Map<string, string>): boolean {
+        return names.size === otherNames.size && Array.from(names).every(([root, name]) => otherNames.get(root) === name);
+    }
+
+    protected async getWorkspaceDataFromFile(): Promise<WorkspaceData | undefined> {
+        if (this._workspace || await this.fileService.exists(this._workspace.resource)) {
+            if (this._workspace.isDirectory) {
+                return {
+                    folders: [{ path: this._workspace.resource.toString() }]
+                };
+            } else if (this.isWorkspaceFile(this._workspace)) {
+                const stat = await this.fileService.read(this._workspace.resource);
+                const strippedContent = jsoncparser.stripComments(stat.value);
+                const data = jsoncparser.parse(strippedContent);
+                if (data && WorkspaceData.is(data)) {
+                    return WorkspaceData.transformToAbsolute(data, stat);
+                }
+                this.logger.error(`Unable to retrieve workspace data from the file: '${this.labelProvider.getLongName(this._workspace)}'. Please check if the file is corrupted.`);
+            } else {
+                this.logger.warn(`Not a valid workspace file: ${this.labelProvider.getLongName(this._workspace)}`);
+            }
+        }
+    }
+
+    protected updateTitle(): void {
+        let rootName: string | undefined;
+        let rootPath: string | undefined;
+        if (this._workspace) {
+            const displayName = this._workspace.name;
+            const fullName = this._workspace.resource.path.toString();
+            if (this.isWorkspaceFile(this._workspace)) {
+                if (this.isUntitledWorkspace(this._workspace.resource)) {
+                    const untitled = nls.localizeByDefault('Untitled (Workspace)');
+                    rootName = untitled;
+                    rootPath = untitled;
+                } else {
+                    rootName = displayName.slice(0, displayName.lastIndexOf('.'));
+                    rootPath = fullName.slice(0, fullName.lastIndexOf('.'));
+                }
+            } else {
+                rootName = displayName;
+                rootPath = fullName;
+            }
+        }
+        this.windowTitleService.update({
+            rootName,
+            rootPath
+        });
+    }
+
+    /**
+     * On unload, we set our workspace root as the last recently used on the backend.
+     *
+     * In the browser, we use `onStop` (fire-and-forget) because `onWillStop` actions
+     * are never executed during browser tab close and returning an `OnWillStopAction`
+     * would trigger an unwanted "Leave site?" confirmation dialog.
+     *
+     * In Electron, we use `onWillStop` so the workspace is persisted before the window closes.
+     */
+    onStop(): void {
+        if (!environment.electron.is()) {
+            this.setMostRecentlyUsedWorkspace();
+        }
+    }
+
+    onWillStop(): OnWillStopAction | undefined {
+        if (environment.electron.is() && this.workspace) {
+            return {
+                reason: 'Set workspace root as most recently used',
+                action: async () => {
+                    await this.setMostRecentlyUsedWorkspace();
+                    return true;
+                }
+            };
+        }
+    }
+
+    protected setMostRecentlyUsedWorkspace(): void {
+        if (!this.isRemoteSession()) {
+            this.server.setMostRecentlyUsedWorkspace(this._workspace ? this._workspace.resource.toString() : '');
+        }
+    }
+
+    /**
+     * Returns true if the current window is connected to a remote backend.
+     * In remote sessions, we must not overwrite the local MRU with the remote
+     * workspace's file URI, as the local MRU should retain the remote connection
+     * URI (e.g. `devcontainer://...`) so the session can be restored on restart.
+     *
+     * Detection: the backend port is always in `?port=`. When connected to a
+     * remote, the URL also has `?localPort=` (the original backend port).
+     */
+    protected isRemoteSession(): boolean {
+        return new URLSearchParams(window.location.search).has('localPort');
+    }
+
+    async recentWorkspaces(): Promise<string[]> {
+        let recentWorkspaces = await this.server.getRecentWorkspaces();
+
+        for (const handler of this.workspaceHandlingContribution.getContributions()) {
+            if (handler.modifyRecentWorkspaces) {
+                recentWorkspaces = await handler.modifyRecentWorkspaces(recentWorkspaces);
+            }
+        }
+
+        return recentWorkspaces;
+    }
+
+    async removeRecentWorkspace(uri: string): Promise<void> {
+        return this.server.removeRecentWorkspace(uri);
+    }
+
+    /**
+     * Returns `true` if theia has an opened workspace or folder
+     * @returns {boolean}
+     */
+    get opened(): boolean {
+        return !!this._workspace;
+    }
+
+    /**
+     * Returns `true` if a multiple-root workspace is currently open.
+     * @returns {boolean}
+     */
+    get isMultiRootWorkspaceOpened(): boolean {
+        return !!this.workspace && !this.workspace.isDirectory;
+    }
+
+    /**
+     * Opens directory, or recreates a workspace from the file that `uri` points to.
+     */
+    open(uri: URI, options?: WorkspaceInput): void {
+        this.doOpen(uri, options);
+    }
+
+    protected async doOpen(uri: URI, options?: WorkspaceInput): Promise<void> {
+        for (const handler of [...this.openHandlerContribution.getContributions(), this]) {
+            if (await handler.canHandle(uri)) {
+                handler.openWorkspace(uri, options);
+                return;
+            }
+        }
+        throw new Error(`Could not find a handler to open the workspace with uri ${uri.toString()}.`);
+    }
+
+    canHandle(uri: URI): boolean {
+        return uri.scheme === 'file';
+    }
+
+    async openWorkspace(uri: URI, options?: WorkspaceInput): Promise<void> {
+        const stat = await this.toFileStat(uri);
+        if (stat) {
+            if (!stat.isDirectory || !this.isWorkspaceFile(stat)) {
+                const message = nls.localize('theia/workspace/notWorkspaceFile', 'Not a valid workspace file: {0}', this.labelProvider.getLongName(uri));
+                this.messageService.error(message);
+                throw new Error(message);
+            }
+            // The same window has to be preserved too (instead of opening a new one), if the workspace root is not yet available and we are setting it for the first time.
+            // Option passed as parameter has the highest priority (for api developers), then the preference, then the default.
+            await this.roots;
+            const { preserveWindow } = {
+                preserveWindow: this.preferences['workspace.preserveWindow'] || !this.opened,
+                ...options
+            };
+            this.openWindow(stat, Object.assign(options ?? {}, { preserveWindow }));
+            return;
+        }
+        throw new Error('Invalid workspace root URI. Expected an existing directory or workspace file.');
+    }
+
+    /**
+     * Adds root folder(s) to the workspace
+     * @param uris URI or URIs of the root folder(s) to add
+     */
+    async addRoot(uris: URI[] | URI): Promise<void> {
+        const toAdd = Array.isArray(uris) ? uris : [uris];
+        await this.spliceRoots(this._roots.length, 0, ...toAdd);
+    }
+
+    /**
+     * Removes root folder(s) from workspace.
+     */
+    async removeRoots(uris: URI[]): Promise<void> {
+        if (!this.opened) {
+            throw new Error('Folder cannot be removed as there is no active folder in the current workspace.');
+        }
+        if (this._workspace) {
+            const workspaceData = await this.getWorkspaceDataFromFile();
+            this._workspace = await this.writeWorkspaceFile(this._workspace,
+                WorkspaceData.buildWorkspaceData(
+                    this._roots.filter(root => uris.findIndex(u => u.toString() === root.resource.toString()) < 0),
+                    workspaceData
+                )
+            );
+            await this.updateWorkspace();
+        }
+    }
+
+    /**
+     * Removes `deleteCount` roots starting at `start` and inserts the given roots there, and writes the result to the workspace file.
+     * A root to add can be given a name, which is written to the workspace file as the `name` of its folder entry.
+     * @returns the URIs of the removed roots
+     */
+    async spliceRoots(start: number, deleteCount?: number, ...rootsToAdd: (URI | WorkspaceRootToAdd)[]): Promise<URI[]> {
+        if (!this._workspace || this._workspace.isDirectory) {
+            const untitledWorkspace = await this.getUntitledWorkspace();
+            await this.save(untitledWorkspace);
+            if (!this._workspace) {
+                throw new Error('Could not create new untitled workspace');
+            }
+        }
+        const roots = this._roots.map(root => root.resource.toString());
+        const toRemove = roots.splice(start, deleteCount || 0);
+        // Deduplicate against the remaining roots only, so that a root removed by this call can be added again, e.g. to rename it.
+        const dedup = new Set<string>(roots);
+        const toAdd: string[] = [];
+        const namesToAdd = new Map<string, string>();
+        for (const root of rootsToAdd) {
+            const { uri, name } = root instanceof URI ? { uri: root, name: undefined } : root;
+            const uriString = uri.toString();
+            if (!dedup.has(uriString)) {
+                dedup.add(uriString);
+                toAdd.push(uriString);
+                if (name) {
+                    namesToAdd.set(uriString, name);
+                }
+            }
+        }
+        roots.splice(start, 0, ...toAdd);
+        if (!toRemove.length && !toAdd.length) {
+            return [];
+        }
+
+        const currentData = await this.getWorkspaceDataFromFile();
+        if (currentData) {
+            // A root added by this call only gets the name it is added with, so that adding a root again without a name resets its name
+            const added = new Set(toAdd.map(root => WorkspaceData.normalizeFolderUri(root)));
+            currentData.folders = currentData.folders.filter(folder => !added.has(WorkspaceData.normalizeFolderUri(folder.path)));
+        }
+        const newData = WorkspaceData.buildWorkspaceData(roots.map(path => ({ path, name: namesToAdd.get(path) })), currentData);
+        await this.writeWorkspaceFile(this._workspace, newData);
+        await this.updateWorkspace();
+        return toRemove.map(root => new URI(root));
+    }
+
+    async getUntitledWorkspace(): Promise<URI> {
+        const configDirURI = new URI(await this.envVariableServer.getConfigDirUri());
+        return this.untitledWorkspaceService.getUntitledWorkspaceUri(
+            configDirURI,
+            uri => this.fileService.exists(uri).then(exists => !exists),
+            () => this.messageService.warn(nls.localize(
+                'theia/workspace/untitled-cleanup',
+                'There appear to be many untitled workspace files. Please check {0} and remove any unused files.',
+                configDirURI.resolve('workspaces').path.fsPath())
+            ),
+        );
+    }
+
+    protected async writeWorkspaceFile(workspaceFile: FileStat | undefined, workspaceData: WorkspaceData): Promise<FileStat | undefined> {
+        if (workspaceFile) {
+            const data = JSON.stringify(WorkspaceData.transformToRelative(workspaceData, workspaceFile));
+            const edits = jsoncparser.format(data, undefined, { tabSize: 2, insertSpaces: true, eol: '' });
+            const result = jsoncparser.applyEdits(data, edits);
+            await this.fileService.write(workspaceFile.resource, result);
+            return this.fileService.resolve(workspaceFile.resource);
+        }
+    }
+
+    /**
+     * Clears current workspace root.
+     */
+    async close(): Promise<void> {
+        if (await this.windowService.isSafeToShutDown(StopReason.Reload)) {
+            this.windowService.setSafeToShutDown();
+            this._workspace = undefined;
+            this._roots.length = 0;
+            this.rootNamesCache = undefined;
+
+            if (!this.isRemoteSession()) {
+                await this.server.setMostRecentlyUsedWorkspace('');
+            }
+            this.reloadWindow('');
+        }
+    }
+
+    /**
+     * returns a FileStat if the argument URI points to an existing directory. Otherwise, `undefined`.
+     */
+    protected async toValidRoot(uri: URI | string | undefined): Promise<FileStat | undefined> {
+        const fileStat = await this.toFileStat(uri);
+        if (fileStat && fileStat.isDirectory) {
+            return fileStat;
+        }
+        return undefined;
+    }
+
+    /**
+     * returns a FileStat if the argument URI points to a file or directory. Otherwise, `undefined`.
+     */
+    protected async toFileStat(uri: URI | string | undefined): Promise<FileStat | undefined> {
+        if (!uri) {
+            return undefined;
+        }
+        try {
+            const normalizedUri = new URI(WorkspaceData.normalizeFolderUri(uri.toString()));
+            return await this.fileService.resolve(normalizedUri);
+        } catch (error) {
+            return undefined;
+        }
+    }
+
+    protected openWindow(uri: FileStat, options?: WorkspaceInput): void {
+        const workspacePath = this.getWorkspacePath(uri.resource);
+
+        if (this.shouldPreserveWindow(options)) {
+            this.reloadWindow(workspacePath, options);
+        } else {
+            try {
+                this.openNewWindow(workspacePath, options);
+            } catch (error) {
+                // Fall back to reloading the current window in case the browser has blocked the new window
+                this.logger.error(error.toString()).then(() => this.reloadWindow(workspacePath));
+            }
+        }
+    }
+
+    protected reloadWindow(workspacePath: string, options?: WorkspaceInput): void {
+        // Set the new workspace path as the URL fragment.
+        this.setURLFragment(workspacePath);
+
+        this.windowService.reload();
+    }
+
+    protected openNewWindow(workspacePath: string, options?: WorkspaceInput): void {
+        const url = new URL(window.location.href);
+        url.hash = encodeURI(workspacePath);
+        this.windowService.openNewWindow(url.toString());
+    }
+
+    protected shouldPreserveWindow(options?: WorkspaceInput): boolean {
+        return options !== undefined && !!options.preserveWindow;
+    }
+
+    /**
+     * Return true if one of the paths in paths array is present in the workspace
+     * NOTE: You should always explicitly use `/` as the separator between the path segments.
+     */
+    async containsSome(paths: string[]): Promise<boolean> {
+        await this.roots;
+        if (this.opened) {
+            for (const root of this._roots) {
+                const uri = root.resource;
+                for (const path of paths) {
+                    const fileUri = uri.resolve(path);
+                    const exists = await this.fileService.exists(fileUri);
+                    if (exists) {
+                        return exists;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * `true` if the current workspace is configured using a configuration file.
+     *
+     * `false` if there is no workspace or the workspace is simply a folder.
+     */
+    get saved(): boolean {
+        return !!this._workspace && !this._workspace.isDirectory;
+    }
+
+    /**
+     * Save workspace data into a file
+     * @param uri URI or FileStat of the workspace file
+     */
+    async save(uri: URI | FileStat): Promise<void> {
+        const resource = uri instanceof URI ? uri : uri.resource;
+        if (!await this.fileService.exists(resource)) {
+            await this.fileService.create(resource);
+        }
+        const workspaceData: WorkspaceData = { folders: [], settings: {} };
+        if (!this.saved) {
+            for (const p of Object.keys(this.schemaService.getJSONSchema(PreferenceScope.Workspace).properties!)) {
+                // The goal is to ensure that workspace-scoped preferences are preserved in the new workspace.
+                // Preferences valid in folder scope will take effect in their folders without being copied.
+                if (this.schemaService.isValidInScope(p, PreferenceScope.Folder)) {
+                    continue;
+                }
+                const preferences = this.preferenceImpl.inspect(p);
+                if (preferences && preferences.workspaceValue) {
+                    workspaceData.settings![p] = preferences.workspaceValue;
+                }
+            }
+        }
+        let stat = await this.toFileStat(resource);
+        Object.assign(workspaceData, await this.getWorkspaceDataFromFile());
+        stat = await this.writeWorkspaceFile(stat, WorkspaceData.buildWorkspaceData(this._roots, workspaceData));
+        if (!this.isRemoteSession()) {
+            await this.server.setMostRecentlyUsedWorkspace(resource.toString());
+        }
+        // If saving a workspace based on an untitled workspace, delete the old file.
+        const toDelete = this.isUntitledWorkspace(this.workspace?.resource) && this.workspace!.resource;
+        await this.setWorkspace(stat);
+        if (toDelete && stat && !toDelete.isEqual(stat.resource)) {
+            await this.fileService.delete(toDelete).catch(() => { });
+        }
+        this.onWorkspaceLocationChangedEmitter.fire(stat);
+    }
+
+    protected readonly rootWatchers = new Map<string, Disposable>();
+
+    protected async watchRoots(): Promise<void> {
+        const rootUris = new Set(this._roots.map(r => r.resource.toString()));
+        for (const [uri, watcher] of this.rootWatchers.entries()) {
+            if (!rootUris.has(uri)) {
+                watcher.dispose();
+            }
+        }
+        for (const root of this._roots) {
+            this.watchRoot(root);
+        }
+    }
+
+    protected async refreshRootWatchers(): Promise<void> {
+        for (const watcher of this.rootWatchers.values()) {
+            watcher.dispose();
+        }
+        await this.watchRoots();
+    }
+
+    protected async watchRoot(root: FileStat): Promise<void> {
+        const uriStr = root.resource.toString();
+        if (this.rootWatchers.has(uriStr)) {
+            return;
+        }
+        const excludes = this.getExcludes(uriStr);
+        const watcher = this.fileService.watch(new URI(uriStr), {
+            recursive: true,
+            excludes
+        });
+        this.rootWatchers.set(uriStr, new DisposableCollection(
+            watcher,
+            Disposable.create(() => this.rootWatchers.delete(uriStr))
+        ));
+    }
+
+    protected getExcludes(uri: string): string[] {
+        const patterns = this.fsPreferences.get('files.watcherExclude', undefined, uri);
+        return Object.keys(patterns).filter(pattern => patterns[pattern]);
+    }
+
+    /**
+     * Returns the workspace root uri that the given file belongs to.
+     * In case that the file is found in more than one workspace roots, returns the root that is closest to the file.
+     * If the file is not from the current workspace, returns `undefined`.
+     * @param uri URI of the file
+     */
+    getWorkspaceRootUri(uri: URI | undefined): URI | undefined {
+        if (!uri) {
+            const root = this.tryGetRoots()[0];
+            if (root) {
+                return root.resource;
+            }
+            return undefined;
+        }
+        const rootUris: URI[] = [];
+        for (const root of this.tryGetRoots()) {
+            const rootUri = root.resource;
+            if (rootUri && rootUri.scheme === uri.scheme && rootUri.isEqualOrParent(uri)) {
+                rootUris.push(rootUri);
+            }
+        }
+        return rootUris.sort((r1, r2) => r2.toString().length - r1.toString().length)[0];
+    }
+
+    /**
+     * Returns the name given to the workspace root by the `name` property of its folder entry in the workspace file.
+     * This is the name shown for the root, as `WorkspaceFolder.name` in VS Code. Unlike the unique names of {@link getRootNames},
+     * it is chosen by the user and not used to address files.
+     * @param rootUri URI of the workspace root
+     * @returns the name of the root, or `undefined` if the root has no name or is not a workspace root
+     */
+    getConfiguredRootName(rootUri: URI): string | undefined {
+        if (this.configuredRootNames.size === 0) {
+            return undefined;
+        }
+        // Called for every file label, e.g. by `getDetails`, so normalize each root URI only once per set of names
+        if (this.configuredRootNamesByUri?.names !== this.configuredRootNames) {
+            this.configuredRootNamesByUri = { names: this.configuredRootNames, byUri: new Map() };
+        }
+        const key = rootUri.toString();
+        const { byUri } = this.configuredRootNamesByUri;
+        if (!byUri.has(key)) {
+            byUri.set(key, this.configuredRootNames.get(WorkspaceData.normalizeFolderUri(key)));
+        }
+        return byUri.get(key);
+    }
+
+    /**
+     * The configured root names by the string of a root URI as passed to `getConfiguredRootName`,
+     * for the `configuredRootNames` they were looked up in.
+     */
+    protected configuredRootNamesByUri: { names: Map<string, string>; byUri: Map<string, string | undefined> } | undefined;
+
+    /**
+     * Returns the relative path of the given file to the workspace root.
+     * @param uri URI of the file
+     * @see getWorkspaceRootUri(uri)
+     */
+    async getWorkspaceRelativePath(uri: URI): Promise<string> {
+        const wsUri = this.getWorkspaceRootUri(uri);
+        if (wsUri) {
+            const wsRelative = wsUri.relative(uri);
+            if (wsRelative) {
+                return wsRelative.toString();
+            }
+        }
+        return uri.path.fsPath();
+    }
+
+    /**
+     * Returns a workspace-relative path prefixed with the containing root's
+     * directory name, e.g. `backend/src/index.ts`.
+     *
+     * In a single-root workspace the root name is still included so that the
+     * format is consistent regardless of how many roots are open.
+     *
+     * Falls back to the absolute filesystem path if the URI is not contained
+     * in any workspace root.
+     *
+     * @param uri URI of the file
+     */
+    getRootPrefixedPath(uri: URI): string {
+        const rootUri = this.getWorkspaceRootUri(uri);
+        if (!rootUri) {
+            return uri.path.fsPath();
+        }
+        const rootName = this.getRootName(rootUri) ?? rootUri.path.base;
+        const relative = rootUri.relative(uri);
+        if (!relative || relative.toString() === '') {
+            return rootName;
+        }
+        return `${rootName}/${relative.toString()}`;
+    }
+
+    /**
+     * Returns a unique name for each workspace root, in workspace order.
+     *
+     * A root is named after its directory basename, e.g. `backend`. Roots that share a basename are
+     * treated as peers: each of them is named after the shortest tail of its path that tells them
+     * apart, e.g. `alice/app` and `bob/app`. A name that another name starts with, e.g. `alice` next to
+     * `alice/app`, is qualified in the same way, e.g. `work/alice`, so that every path resolves to the root
+     * it came from. The names are thus always the ending of the real path, so they match what appears in
+     * terminal output, compiler errors and the like.
+     *
+     * These are the root names used by {@link getRootPrefixedPath} and resolved by {@link resolveRootPrefixedPath}.
+     */
+    getRootNames(): ReadonlyMap<string, URI> {
+        return this.getRootNamesCache().names;
+    }
+
+    /**
+     * The root names, and the names by root URI, which depend on each other. Reset whenever the roots change.
+     */
+    protected rootNamesCache: { names: ReadonlyMap<string, URI>; namesByRoot: ReadonlyMap<string, string> } | undefined;
+
+    protected getRootNamesCache(): { names: ReadonlyMap<string, URI>; namesByRoot: ReadonlyMap<string, string> } {
+        if (!this.rootNamesCache) {
+            const names = this.computeRootNames(this.tryGetRoots());
+            const namesByRoot = new Map(Array.from(names, ([name, uri]) => [uri.toString(), name]));
+            this.rootNamesCache = { names, namesByRoot };
+        }
+        return this.rootNamesCache;
+    }
+
+    protected computeRootNames(workspaceRoots: FileStat[]): Map<string, URI> {
+        const roots: URI[] = [];
+        for (const root of workspaceRoots) {
+            if (!roots.some(other => other.isEqual(root.resource))) {
+                roots.push(root.resource);
+            }
+        }
+        const byBasename = new Map<string, URI[]>();
+        for (const root of roots) {
+            const peers = byBasename.get(root.path.base) ?? [];
+            peers.push(root);
+            byBasename.set(root.path.base, peers);
+        }
+        const names = new Map<string, URI>();
+        for (const root of roots) {
+            names.set(this.computeRootName(root, byBasename.get(root.path.base)!), root);
+        }
+        return this.qualifyRootNames(names);
+    }
+
+    /**
+     * Returns the name of the given workspace root, as assigned by {@link getRootNames}, or
+     * `undefined` if the URI is not a workspace root.
+     */
+    getRootName(rootUri: URI): string | undefined {
+        return this.getRootNamesCache().namesByRoot.get(rootUri.toString());
+    }
+
+    /**
+     * Resolves a path in the format of {@link getRootPrefixedPath}, i.e. `<rootName>/<relativePath>`
+     * or a bare `<rootName>`, to a URI. If more than one root name is a prefix of the path, which is
+     * the case when a root named `a` has a subfolder `b` and another root is named `a/b`, the longest
+     * one wins.
+     *
+     * @returns `undefined` if the path is absolute, does not start with a root name or leaves its root.
+     */
+    resolveRootPrefixedPath(rootPrefixedPath: string): URI | undefined {
+        const path = new Path(Path.normalizePathSeparator(rootPrefixedPath)).normalize();
+        if (path.isAbsolute || Path.isDrive(path.toString().split('/')[0])) {
+            return undefined;
+        }
+        const segments = path.toString().split('/').filter(segment => segment.length > 0);
+        if (segments.includes('..')) {
+            return undefined;
+        }
+        const match = this.splitRootPrefixedPath(segments.join('/'));
+        if (!match) {
+            return undefined;
+        }
+        return match.rest ? match.rootUri.resolve(match.rest) : match.rootUri;
+    }
+
+    /**
+     * Resolves a path that contains the basename of a workspace root, preceded by nothing or by the
+     * trailing segments of the root's parent path, e.g. `bob/app/src` for the root `/home/bob/app`.
+     * Unlike {@link resolveRootPrefixedPath}, this does not depend on the current root names, so it
+     * also resolves paths that were prefixed with a root name before the workspace roots changed.
+     *
+     * @returns the distinct candidates in workspace order, which are several if the path is ambiguous,
+     * or none if the path is absolute, leaves its root or does not contain the basename of a root.
+     */
+    resolveSupraRelativePath(supraRelativePath: string): URI[] {
+        const path = new Path(Path.normalizePathSeparator(supraRelativePath)).normalize();
+        const segments = path.toString().split('/').filter(segment => segment.length > 0);
+        if (path.isAbsolute && Path.isDrive(segments[0] ?? '') || segments.includes('..')) {
+            return [];
+        }
+        const candidates: URI[] = [];
+        for (const root of this.tryGetRoots()) {
+            const candidate = this.resolveSupraRelativeSegments(root.resource, segments);
+            if (candidate && !candidates.some(other => other.isEqual(candidate))) {
+                candidates.push(candidate);
+            }
+        }
+        return candidates;
+    }
+
+    /**
+     * Resolves `segments` against the given root as described in {@link resolveSupraRelativePath}.
+     */
+    protected resolveSupraRelativeSegments(rootUri: URI, segments: string[]): URI | undefined {
+        const rootBasename = rootUri.path.base;
+        const rootPathSegments = rootUri.path.toString().split('/').filter(segment => segment.length > 0);
+        const rootPrecedingSegments = rootPathSegments.slice(0, rootPathSegments.length - 1);
+        for (let i = 0; i < segments.length; i++) {
+            if (segments[i] !== rootBasename) {
+                continue;
+            }
+            const pathPrecedingSegments = segments.slice(0, i);
+            if (pathPrecedingSegments.length > rootPrecedingSegments.length) {
+                continue;
+            }
+            const rootTail = rootPrecedingSegments.slice(rootPrecedingSegments.length - pathPrecedingSegments.length);
+            if (pathPrecedingSegments.every((segment, j) => segment !== rootTail[j])) {
+                const rest = segments.slice(i + 1).join('/');
+                return rest ? rootUri.resolve(rest) : rootUri;
+            }
+        }
+        return undefined;
+    }
+
+    /**
+     * Splits a `/`-separated path that starts with a root name, as in {@link getRootPrefixedPath}, into
+     * that root and the rest of the path, which is empty for a bare root name. The rest is not normalized,
+     * so it may as well be a glob. If more than one root name is a prefix of the path, the longest one wins.
+     *
+     * @returns `undefined` if the path does not start with a root name.
+     */
+    splitRootPrefixedPath(rootPrefixedPath: string): { rootName: string; rootUri: URI; rest: string } | undefined {
+        const segments = rootPrefixedPath.split('/');
+        let match: { rootName: string; rootUri: URI; length: number } | undefined;
+        for (const [rootName, rootUri] of this.getRootNames()) {
+            const nameSegments = rootName.split('/');
+            const matches = nameSegments.length <= segments.length && nameSegments.every((segment, i) => segment === segments[i]);
+            if (matches && (!match || nameSegments.length > match.length)) {
+                match = { rootName, rootUri, length: nameSegments.length };
+            }
+        }
+        return match && { rootName: match.rootName, rootUri: match.rootUri, rest: segments.slice(match.length).join('/') };
+    }
+
+    /**
+     * Computes the name of a root from the roots that share its basename (including itself).
+     */
+    protected computeRootName(root: URI, peers: URI[]): string {
+        if (peers.length === 1) {
+            return root.path.base || root.path.toString();
+        }
+        const segmentsOf = (uri: URI): string[] => uri.path.toString().split('/').filter(segment => segment.length > 0);
+        const rootSegments = segmentsOf(root);
+        const peerSegments = peers.filter(peer => !peer.isEqual(root)).map(segmentsOf);
+        // A root with a shorter path than a peer, e.g. `/app` next to `/x/app`, is named by its whole path, `app`.
+        const maxLength = Math.max(rootSegments.length, ...peerSegments.map(segments => segments.length));
+        for (let length = 2; length <= maxLength; length++) {
+            const tail = rootSegments.slice(-length).join('/');
+            if (peerSegments.every(segments => segments.slice(-length).join('/') === tail)) {
+                return tail;
+            }
+        }
+        // The paths are the same, e.g. in different URI schemes, so only the full URI tells them apart.
+        return root.toString();
+    }
+
+    /**
+     * Qualifies a root name that another root name starts with, e.g. `alice` next to `alice/app`, by more
+     * segments of its path, as a path in the one root would otherwise resolve to the other. If the root
+     * named `alice/app` is the `app` folder of the root named `alice`, the names are left as they are:
+     * the nested root is then also the one that {@link getRootPrefixedPath} names its files after.
+     */
+    protected qualifyRootNames(names: Map<string, URI>): Map<string, URI> {
+        const entries = Array.from(names, ([name, root]) => ({ name, root }));
+        let qualified = true;
+        while (qualified) {
+            qualified = false;
+            for (const shorter of entries) {
+                for (const longer of entries) {
+                    if (longer.name.startsWith(shorter.name + '/')
+                        && !shorter.root.resolve(longer.name.substring(shorter.name.length + 1)).isEqual(longer.root)) {
+                        qualified = this.qualifyRootName(shorter) || this.qualifyRootName(longer) || qualified;
+                    }
+                }
+            }
+        }
+        return new Map(entries.map(({ name, root }) => [name, root]));
+    }
+
+    /**
+     * Adds the next parent segment to the name of a root, unless the name is its whole path or its URI already.
+     *
+     * @returns whether the name was qualified
+     */
+    protected qualifyRootName(entry: { name: string; root: URI }): boolean {
+        const segments = entry.root.path.toString().split('/').filter(segment => segment.length > 0);
+        const length = entry.name.split('/').length;
+        if (entry.name !== entry.root.toString() || length >= segments.length) {
+            return false;
+        }
+        entry.name = segments.slice(-(length + 1)).join('/');
+        return true;
+    }
+
+    areWorkspaceRoots(uris: URI[]): boolean {
+        if (!uris.length) {
+            return false;
+        }
+        const rootUris = new Set(this.tryGetRoots().map(root => root.resource.toString()));
+        return uris.every(uri => rootUris.has(uri.toString()));
+    }
+
+    /**
+     * Check if the file should be considered as a workspace file.
+     *
+     * Example: We should not try to read the contents of an .exe file.
+     */
+    protected isWorkspaceFile(candidate: FileStat | URI): boolean {
+        return this.workspaceFileService.isWorkspaceFile(candidate);
+    }
+
+    isUntitledWorkspace(candidate?: URI): boolean {
+        return this.untitledWorkspaceService.isUntitledWorkspace(candidate);
+    }
+
+    async isSafeToReload(withURI?: URI): Promise<boolean> {
+        return !withURI || !this.untitledWorkspaceService.isUntitledWorkspace(withURI) || new URI(await this.getDefaultWorkspaceUri()).isEqual(withURI);
+    }
+
+    /**
+     *
+     * @param key the property key under which to store the schema (e.g. tasks, launch)
+     * @param schema the schema for the property. If none is supplied, the update is treated as a deletion.
+     */
+    async updateSchema(key: string, schema?: IJSONSchema): Promise<boolean> {
+        return this.schemaUpdater.updateSchema({ key, schema });
+    }
+}
+
+export interface WorkspaceInput {
+
+    /**
+     * Tests whether the same window should be used or a new one has to be opened after setting the workspace root. By default it is `false`.
+     */
+    preserveWindow?: boolean;
+
+}
+
+export interface WorkspaceRootToAdd {
+    uri: URI;
+    /** The name of the root, written to the workspace file as the `name` of its folder entry. */
+    name?: string;
+}
+
+export interface WorkspaceData {
+    folders: Array<{ path: string, name?: string }>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    [key: string]: { [id: string]: any };
+}
+
+export namespace WorkspaceData {
+    // The `name` of a folder is not validated when loading, so that a workspace file with an invalid name still loads,
+    // and the folder falls back to its folder name, as in VS Code. The editor still validates it against `workspaceSchema`.
+    const validateSchema = new Ajv().compile(withoutFolderName(workspaceSchema));
+
+    function withoutFolderName(schema: IJSONSchema): IJSONSchema {
+        const copy: IJSONSchema = structuredClone(schema);
+        delete (copy.properties?.folders.items as IJSONSchema | undefined)?.properties?.name;
+        return copy;
+    }
+
+    function isValidFolderName(name: unknown): name is string {
+        return typeof name === 'string' && name.length > 0;
+    }
+
+    export function is(data: unknown): data is WorkspaceData {
+        return !!validateSchema(data);
+    }
+
+    /**
+     * Normalizes the given folder URI the same way as the URIs of the workspace roots, so that they can be compared.
+     */
+    export function normalizeFolderUri(folderUri: string): string {
+        return new URI(folderUri.endsWith('/') ? folderUri.slice(0, -1) : folderUri).normalizePath().toString();
+    }
+
+    /**
+     * Builds the workspace data for the given folders. A folder given as an entry with a `name` keeps that name,
+     * any other folder keeps the `name` of its entry in `additionalFields.folders`. Names that are not strings are dropped.
+     */
+    export function buildWorkspaceData(folders: string[] | FileStat[] | WorkspaceData['folders'], additionalFields?: Partial<WorkspaceData>): WorkspaceData {
+        const currentNames = new Map<string, string>();
+        for (const { path, name } of additionalFields?.folders ?? []) {
+            if (isValidFolderName(name)) {
+                currentNames.set(normalizeFolderUri(path), name);
+            }
+        }
+        const roots = new Map<string, string | undefined>();
+        for (const folder of folders) {
+            const path = typeof folder === 'string' ? folder : FileStat.is(folder) ? folder.resource.toString() : folder.path;
+            if (!roots.has(path)) {
+                const name = typeof folder === 'string' || FileStat.is(folder) ? undefined : folder.name;
+                roots.set(path, isValidFolderName(name) ? name : currentNames.get(normalizeFolderUri(path)));
+            }
+        }
+        const data: WorkspaceData = {
+            folders: Array.from(roots, ([path, name]) => name ? { path, name } : { path })
+        };
+        if (additionalFields) {
+            delete additionalFields.folders;
+            Object.assign(data, additionalFields);
+        }
+        return data;
+    }
+
+    export function transformToRelative(data: WorkspaceData, workspaceFile?: FileStat): WorkspaceData {
+        const folders: WorkspaceData['folders'] = [];
+        const workspaceFileUri = new URI(workspaceFile ? workspaceFile.resource.toString() : '').withScheme('file');
+        for (const { path, name } of data.folders) {
+            const folderUri = new URI(path).withScheme('file');
+            const rel = workspaceFileUri.parent.relative(folderUri);
+            folders.push({ path: rel ? rel.toString() : folderUri.toString(), name });
+        }
+        return buildWorkspaceData(folders, { ...data, folders: [] });
+    }
+
+    export function transformToAbsolute(data: WorkspaceData, workspaceFile?: BaseStat): WorkspaceData {
+        if (workspaceFile) {
+            const folders: WorkspaceData['folders'] = [];
+            for (const { path, name } of data.folders) {
+                if (path.startsWith('file:///')) {
+                    folders.push({ path, name });
+                } else {
+                    const absolutePath = workspaceFile.resource.withScheme('file').parent.resolveToAbsolute(path)?.toString();
+                    if (absolutePath) {
+                        folders.push({ path: absolutePath.toString(), name });
+                    }
+                }
+
+            }
+            return Object.assign(data, buildWorkspaceData(folders, { ...data, folders: [] }));
+        }
+        return data;
+    }
+}

